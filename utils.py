@@ -10,7 +10,8 @@ from datetime import datetime
 # Third-party imports
 import gradio as gr
 from groq import Groq
-from sentence_transformers import SentenceTransformer
+from google import genai
+from google.genai import types
 from tinydb import TinyDB, Query
 import numpy as np
 
@@ -38,28 +39,25 @@ class DirectoryStructureAgent:
     project description, tech stack, team roles, and best practices.
     """
     
-    def __init__(self, groq_api_key: str, example_repo_index=None, cache_db_path="cache.json"):
+    def __init__(self, groq_api_key: str, cache_db_path="cache.json"):
         """
         Initialize the DirectoryStructureAgent
         
         Args:
             groq_api_key: GROQ API key for LLM inference
-            example_repo_index: Optional SentenceTransformer model for similarity search
             cache_db_path: Path to cache database file
         """
         self.groq_client = Groq(api_key=groq_api_key)
-        self.example_repo_index = example_repo_index
         self.cache_db = TinyDB(cache_db_path)
         
-        # Initialize sentence transformer for similarity search (optional)
+        # Initialize Gemini client for embeddings
+        # The client gets the API key from the environment variable `GEMINI_API_KEY`.
         try:
-            if example_repo_index is None:
-                self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
-            else:
-                self.sentence_model = example_repo_index
+            self.gemini_client = genai.Client()
+            self.embedding_model = "gemini-embedding-exp-03-07"
         except Exception as e:
-            logger.warning(f"Could not load sentence transformer: {e}")
-            self.sentence_model = None
+            logger.warning(f"Could not initialize Gemini client: {e}")
+            self.gemini_client = None
         
         # Load example repositories for similarity matching
         self.example_repos = self._load_example_repos()
@@ -141,23 +139,46 @@ class DirectoryStructureAgent:
         cache_string = json.dumps(cache_data, sort_keys=True)
         return hashlib.md5(cache_string.encode()).hexdigest()
     
+    def _get_gemini_embedding(self, text: str) -> Optional[np.ndarray]:
+        """Get embedding from Gemini"""
+        if not self.gemini_client:
+            return None
+        
+        try:
+            result = self.gemini_client.models.embed_content(
+                model=self.embedding_model,
+                contents=text,
+                config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY")
+            )
+            # Extract the actual embedding values from ContentEmbedding object
+            embedding_values = result.embeddings[0].values
+            return np.array(embedding_values)
+        except Exception as e:
+            logger.error(f"Gemini embedding failed: {e}")
+            return None
+    
     def _find_similar_repos(self, project_desc: str, tech_stack: List[str], top_k: int = 2) -> List[Dict]:
-        """Find similar repository examples using sentence similarity"""
-        if not self.sentence_model:
+        """Find similar repository examples using Gemini embeddings"""
+        if not self.gemini_client:
             return []
         
         try:
             query_text = f"{project_desc} {' '.join(tech_stack)}"
-            query_embedding = self.sentence_model.encode([query_text])
+            query_embedding = self._get_gemini_embedding(query_text)
+            
+            if query_embedding is None:
+                return []
             
             similarities = []
             for repo in self.example_repos:
                 repo_text = f"{repo['description']} {' '.join(repo['tech_stack'])}"
-                repo_embedding = self.sentence_model.encode([repo_text])
-                similarity = np.dot(query_embedding[0], repo_embedding[0]) / (
-                    np.linalg.norm(query_embedding[0]) * np.linalg.norm(repo_embedding[0])
-                )
-                similarities.append((similarity, repo))
+                repo_embedding = self._get_gemini_embedding(repo_text)
+                
+                if repo_embedding is not None:
+                    similarity = np.dot(query_embedding, repo_embedding) / (
+                        np.linalg.norm(query_embedding) * np.linalg.norm(repo_embedding)
+                    )
+                    similarities.append((similarity, repo))
             
             # Sort by similarity and return top_k
             similarities.sort(key=lambda x: x[0], reverse=True)
@@ -431,6 +452,7 @@ Generate the directory structure now:"""
 def create_agent():
     """Create DirectoryStructureAgent instance"""
     groq_api_key = os.environ.get("GROQ_API_KEY")
+    
     if not groq_api_key:
         raise ValueError("GROQ_API_KEY not found in environment variables")
     
